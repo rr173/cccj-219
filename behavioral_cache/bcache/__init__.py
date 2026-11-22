@@ -3,6 +3,13 @@
 from .encoding import MISSING
 from .errors import KeyNotFound, ReaderError, TableNotFound, UnknownColumn
 from .jobs import JobIdentity, build_identity
+from .materialize import (
+    CorrectionLogError,
+    KeyConflictError,
+    MaterializeError,
+    MaterializeResult,
+    materialize_as_of,
+)
 from .output import OutputPackage, OutputSink, read_package
 from .predicate import (
     and_,
@@ -30,6 +37,11 @@ __all__ = [
     "UnknownColumn",
     "JobIdentity",
     "build_identity",
+    "CorrectionLogError",
+    "KeyConflictError",
+    "MaterializeError",
+    "MaterializeResult",
+    "materialize_as_of",
     "OutputPackage",
     "OutputSink",
     "read_package",

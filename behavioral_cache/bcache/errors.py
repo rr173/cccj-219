@@ -35,3 +35,7 @@ class KeyNotFound(ReaderError):
 
 class SchemaError(ValueError):
     """Invalid schema declaration while building a snapshot."""
+
+
+class SnapshotConflict(RuntimeError):
+    """A snapshot id is already published with different content."""

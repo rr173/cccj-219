@@ -73,6 +73,7 @@ bcache/            库代码
   output.py        类型化输出关系包（.bpkg，自校验摘要）
   jobs.py          作业加载、版本固定、合作式合同执行
   store.py         缓存库、锁、所有权、确定性合同、run/inspect/why/verify
+  materialize.py   时点快照（基准 + 无序更正日志 → 新快照）
   cli.py           命令行
 jobs/              两个手工合同作业
 tests/             单元测试、独立验收、并发测试、大快照生成器（无大数据入库）
@@ -88,7 +89,66 @@ python3 -I bcache_run.py run <job.py> --registry <reg> --cache <cache> \
 python3 -I bcache_run.py why-recompute <job.py> --registry <reg> --cache <cache>
 python3 -I bcache_run.py inspect <entry_id> --cache <cache>
 python3 -I bcache_run.py verify-result <entry_id> --cache <cache>
+python3 -I bcache_run.py materialize-as-of --registry <reg> --base <id> \
+    --changes <log.jsonl> --effective-at <T> --known-through <S> --output-id <id>
 ```
+
+## 时点快照：`materialize-as-of`
+
+操作员从一份显式指定的基准快照和一份**无序**更正日志生成某个业务时点的
+新快照。产物是普通不可变快照，现有作业用 `--snapshot-id <id>`（或
+`CacheStore.run(..., snapshot_id=<id>)`）直接读取；**不**改动 `current`，
+也不运行或改造缓存作业。
+
+```bash
+python3 -I bcache_run.py materialize-as-of \
+    --registry /srv/bcache/registry \
+    --base base-2026-11-15 \
+    --changes corrections.jsonl \
+    --effective-at 1763000000 \
+    --known-through 42 \
+    --output-id 2026-11-20-known-42
+```
+
+成功时打印 `output_id`、内容 `digest`、`outcome`（`published` 或
+`unchanged`）与计数。退出码：`0` 成功；`2` 日志非法/参数非法；`3` 最终视图
+键冲突；`4` 同一 ID 已有不同内容（拒绝且不覆盖）。
+
+### 日志格式（UTF-8 JSONL）
+
+每行一个对象：
+
+```json
+{"seq": 8, "table": "sales", "row_id": 1, "from": 10, "to": 40, "op": "put", "values": {"k": "B", "n": 11}}
+{"seq": 14, "table": "sales", "row_id": 1, "from": 20, "to": 30, "op": "delete"}
+```
+
+- `seq`（全局唯一正整数）、`row_id`、`from`、`to` 均为有符号 64 位整数；
+  布尔值不被当作整数。区间 `[from, to)`，`to:null` 表示无结束时间，有限区间
+  需 `from < to`。
+- `op` 为 `put`（必须带 `values`，且给出该表**全部列**的完整新值，允许显式
+  `null`，沿用基准列类型）或 `delete`（不带 `values`）。
+- 不支持增删表或改 schema；`table` 必须是基准中存在的表。
+
+### 选择规则
+
+仅 `seq <= S` 且区间包含 `T` 的记录参与选行；对每个 `(table, row_id)`，登记
+序号最大者获胜；无候选则保留基准状态。获胜 `delete` 不输出该行，获胜 `put`
+替换该行全部单元格。区间过期后，该行自动回落到仍适用的更早记录或基准值。
+
+### 校验与安全
+
+- 所有日志行都做输入/类型校验，包括本次时点不可见的更正；同 `seq` 的**相同**
+  事件（按已解析且通过类型校验的字段比较，忽略 JSON 键顺序）允许重送，同号
+  不同内容、重复 JSON 成员、未知字段或坏类型拒绝整次请求。
+- lookup 键唯一性只针对**实际交付的最终视图**做集合式检查：键交换或删除一
+  行由另一行接手其键，只要最终合法即成功，绝不按文件顺序逐条套用基准约束。
+- 完整构建并校验成功后才把目录原子移入 registry，该 ID 才对读者可见；失败
+  不留半成品，旧快照继续可读。同一 ID 相同内容返回成功（`unchanged`），不同
+  内容拒绝且不覆盖。
+- 日志逐行解析并落入临时 SQLite 暂存；只保留 T 的获胜者，基准逐表逐行流式
+  复制，最终摘要也以流式游标计算——峰值内存不随日志条数、基准行数或获胜行
+  数线性增长。逻辑内容相同的快照内容摘要与日志顺序、重送及输出 ID 无关。
 
 ## 作业合同
 

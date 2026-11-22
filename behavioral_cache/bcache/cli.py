@@ -8,7 +8,13 @@ import sys
 from typing import Any
 
 from .jobs import build_identity
-from .snapshot import SnapshotRegistry
+from .materialize import (
+    CorrectionLogError,
+    KeyConflictError,
+    MaterializeError,
+    materialize_as_of,
+)
+from .snapshot import SnapshotConflict, SnapshotRegistry
 from .store import CacheStore
 
 
@@ -20,6 +26,45 @@ def _load_params(text: str | None) -> Any:
 
 def _print(obj: Any) -> None:
     print(json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def _materialize(args) -> int:
+    registry = SnapshotRegistry(args.registry)
+    try:
+        result = materialize_as_of(
+            registry,
+            args.base,
+            args.changes,
+            args.effective_at,
+            args.known_through,
+            args.output_id,
+        )
+    except CorrectionLogError as exc:
+        print("invalid corrections log: %s" % exc, file=sys.stderr)
+        return 2
+    except KeyConflictError as exc:
+        print("final view rejected: %s" % exc, file=sys.stderr)
+        return 3
+    except MaterializeError as exc:
+        print("cannot materialize: %s" % exc, file=sys.stderr)
+        return 2
+    except SnapshotConflict as exc:
+        print("publication refused: %s" % exc, file=sys.stderr)
+        return 4
+    _print(
+        {
+            "output_id": result.snapshot.snapshot_id,
+            "digest": result.snapshot.digest,
+            "outcome": result.outcome,
+            "base": result.base_snapshot_id,
+            "effective_at": result.effective_at,
+            "known_through": result.known_through,
+            "corrections_seen": result.corrections_seen,
+            "corrections_eligible": result.corrections_eligible,
+            "winner_rows": result.winner_rows,
+        }
+    )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -53,7 +98,20 @@ def main(argv: list[str] | None = None) -> int:
     p_ver.add_argument("entry_id")
     p_ver.add_argument("--cache", required=True)
 
+    p_mat = sub.add_parser(
+        "materialize-as-of",
+        help="build a new snapshot from a base snapshot and corrections log",
+    )
+    p_mat.add_argument("--registry", required=True)
+    p_mat.add_argument("--base", required=True)
+    p_mat.add_argument("--changes", required=True)
+    p_mat.add_argument("--effective-at", required=True, type=int)
+    p_mat.add_argument("--known-through", required=True, type=int)
+    p_mat.add_argument("--output-id", required=True)
+
     args = parser.parse_args(argv)
+    if args.command == "materialize-as-of":
+        return _materialize(args)
     store = CacheStore(args.cache)
     try:
         if args.command == "run":

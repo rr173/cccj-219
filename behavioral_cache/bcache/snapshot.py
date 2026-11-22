@@ -25,7 +25,7 @@ from .encoding import (
     encode_schema,
     encode_value,
 )
-from .errors import SchemaError, TableNotFound, UnknownColumn
+from .errors import SchemaError, SnapshotConflict, TableNotFound, UnknownColumn
 
 DB_FILENAME = "snapshot.sqlite3"
 MANIFEST_FILENAME = "manifest.txt"
@@ -124,6 +124,23 @@ class Snapshot:
         ).fetchone()
         return int(row[0])
 
+    def fingerprint(self) -> str:
+        """Digest of the exact on-disk bytes (logical digest lives in manifest).
+
+        Used for cheap re-validation of the publish race: a snapshot moved into
+        place is only trusted after its bytes are shown to match the staged copy.
+        """
+        import hashlib
+
+        h = hashlib.blake2b(digest_size=32)
+        with open(self.db_path, "rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+
 
 def _like_prefix(prefix: str) -> str:
     out = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -165,6 +182,11 @@ class SnapshotBuilder:
         self._table_cache: dict[str, list[tuple[str, str]]] = {}
         self._finalized = False
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """The staging database connection (used by bounded-memory derivatives)."""
+        return self._conn
+
     def _create_schema(self) -> None:
         self._conn.executescript(
             """
@@ -190,6 +212,9 @@ class SnapshotBuilder:
             );
             CREATE INDEX cells_lookup
                 ON cells (table_name, row_id, col_name);
+            CREATE INDEX cells_by_column
+                ON cells (table_name, col_name, value_type, int_value,
+                          text_value, bool_value);
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """
         )
@@ -259,9 +284,11 @@ class SnapshotBuilder:
 
     @staticmethod
     def _stored_type(col_type: str, value: Any) -> str:
+        # The *declared* column type decides the stored domain: a bool value in
+        # an int64 column is a type error, not a new domain.
         if value is None:
             return "null"
-        if col_type == "bool" or isinstance(value, bool):
+        if col_type == "bool":
             return "bool"
         if col_type == "text":
             return "text"
@@ -426,7 +453,12 @@ class SnapshotBuilder:
     # -- finalisation -------------------------------------------------------
 
     def compute_digest(self) -> str:
-        """Content digest over tables, schemas and typed rows in canonical order."""
+        """Content digest over tables, schemas and typed rows in canonical order.
+
+        The scan is streamed table by table and row by row (one row's cells are
+        buffered at most), so digesting a large snapshot never materialises its
+        row id set or its rows.
+        """
         hasher = StreamHasher(namespace="snapshot-v" + FORMAT_VERSION)
         names = [
             r[0]
@@ -449,30 +481,50 @@ class SnapshotBuilder:
                 encode_value(key_col) if key_col is not None else encode_value(MISSING)
             )
             hasher.update_encoded(encode_schema(schema))
-            row_ids = [
-                r[0]
-                for r in self._conn.execute(
-                    "SELECT DISTINCT row_id FROM cells "
-                    "WHERE table_name = ? ORDER BY row_id",
-                    (name,),
-                )
-            ]
-            hasher.update_encoded(_uleb128(len(row_ids)))
-            for rid in row_ids:
-                hasher.update_encoded(encode_value(rid))
-                cell_map = {
-                    r[0]: _decode_cell(r[1], r[2], r[3], r[4])
-                    for r in self._conn.execute(
-                        "SELECT col_name, value_type, int_value, text_value, "
-                        "bool_value FROM cells WHERE table_name = ? AND row_id = ?",
-                        (name, rid),
-                    )
-                }
-                for col, _ in schema:
-                    hasher.update_encoded(
-                        encode_value(cell_map.get(col, MISSING))
-                    )
+            row_count = self._conn.execute(
+                "SELECT COUNT(DISTINCT row_id) FROM cells WHERE table_name = ?",
+                (name,),
+            ).fetchone()[0]
+            hasher.update_encoded(_uleb128(int(row_count)))
+            self._digest_rows(name, schema, hasher)
         return hasher.hexdigest()
+
+    def _digest_rows(
+        self,
+        table: str,
+        schema: list[tuple[str, str]],
+        hasher: StreamHasher,
+    ) -> None:
+        cursor = self._conn.execute(
+            "SELECT row_id, col_name, value_type, int_value, text_value, "
+            "bool_value FROM cells WHERE table_name = ? ORDER BY row_id, col_name",
+            (table,),
+        )
+        wanted = {col for col, _ in schema}
+        current_id: Any = None
+        cell_map: dict[str, Any] = {}
+        for raw in cursor:
+            rid = raw[0]
+            if rid != current_id:
+                if current_id is not None:
+                    self._digest_one_row(current_id, schema, cell_map, hasher)
+                current_id = rid
+                cell_map = {}
+            if raw[1] in wanted:
+                cell_map[raw[1]] = _decode_cell(raw[2], raw[3], raw[4], raw[5])
+        if current_id is not None:
+            self._digest_one_row(current_id, schema, cell_map, hasher)
+
+    @staticmethod
+    def _digest_one_row(
+        row_id: Any,
+        schema: list[tuple[str, str]],
+        cell_map: dict[str, Any],
+        hasher: StreamHasher,
+    ) -> None:
+        hasher.update_encoded(encode_value(row_id))
+        for col, _ in schema:
+            hasher.update_encoded(encode_value(cell_map.get(col, MISSING)))
 
     def finalize(self, snapshot_id: Optional[str] = None) -> Snapshot:
         self._conn.commit()
@@ -514,21 +566,51 @@ class SnapshotRegistry:
         self.pointer_path = os.path.join(root, POINTER_FILENAME)
 
     def publish(self, snapshot: Snapshot) -> None:
-        """Register an already-finalised snapshot under its id."""
+        """Register an already-finalised snapshot under its id and make current."""
+        self.publish_without_current(snapshot)
+        self.set_current(snapshot.snapshot_id)
+
+    def publish_without_current(self, snapshot: Snapshot) -> str:
+        """Register a snapshot under its id without touching ``current``.
+
+        Returns ``"unchanged"`` when the id already holds identical content,
+        ``"published"`` when the snapshot was newly moved into place.
+        Identical content under the same id is an idempotent success; different
+        content under an existing id raises :class:`SnapshotConflict` *before*
+        anything is moved, so no partial or overwriting publish can happen.
+        """
         target = os.path.join(self.snapshots_dir, snapshot.snapshot_id)
         if os.path.exists(target):
             existing = self.open(snapshot.snapshot_id)
+            if existing.digest == snapshot.digest:
+                return "unchanged"
+            raise SnapshotConflict(
+                "snapshot id %s already holds different content"
+                % snapshot.snapshot_id
+            )
+        # The staged copy is already complete and validated by the builder;
+        # moving the directory is the atomic publish point.
+        tmp = target + ".tmp-%d-%s" % (os.getpid(), id(snapshot))
+        shutil.copytree(snapshot.path, tmp)
+        try:
+            if not os.path.exists(target):
+                os.rename(tmp, target)
+                return "published"
+            # Someone published concurrently; judge by content, not by timing.
+            existing = self.open(snapshot.snapshot_id)
             if existing.digest != snapshot.digest:
-                raise RuntimeError(
-                    "snapshot id %s reused with different content"
+                raise SnapshotConflict(
+                    "snapshot id %s already holds different content"
                     % snapshot.snapshot_id
                 )
-        else:
-            # Atomic directory publish: move into place, then rename pointer.
-            tmp = target + ".tmp-%d" % os.getpid()
-            shutil.copytree(snapshot.path, tmp)
-            os.rename(tmp, target)
-        self.set_current(snapshot.snapshot_id)
+            if existing.fingerprint() != snapshot.fingerprint():
+                raise SnapshotConflict(
+                    "snapshot id %s was published with different bytes"
+                    % snapshot.snapshot_id
+                )
+            return "unchanged"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def set_current(self, snapshot_id: str) -> None:
         tmp = self.pointer_path + ".tmp"
