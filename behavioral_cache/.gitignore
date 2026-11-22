@@ -1,0 +1,8 @@
+# Runtime data — large snapshots and caches are never committed.
+registry/
+cache/
+*.sqlite3
+*.bpkg
+__pycache__/
+*.pyc
+/tmp/
