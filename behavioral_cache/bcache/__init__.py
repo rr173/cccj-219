@@ -25,6 +25,14 @@ from .predicate import (
     or_,
 )
 from .reader import LookupResult, Reader, RecordingReader, Row
+from .reconcile import (
+    PendingDecisions,
+    ReconcileDecisionError,
+    ReconcileError,
+    ReconcileInputError,
+    ReconcileResult,
+    reconcile_table,
+)
 from .replayer import ReplayReport, ReplayValidator, observations_equal
 from .rollup import (
     RollupContractError,
@@ -68,6 +76,12 @@ __all__ = [
     "Reader",
     "RecordingReader",
     "Row",
+    "PendingDecisions",
+    "ReconcileDecisionError",
+    "ReconcileError",
+    "ReconcileInputError",
+    "ReconcileResult",
+    "reconcile_table",
     "ReplayReport",
     "ReplayValidator",
     "observations_equal",

@@ -1,5 +1,5 @@
 """Command line entries: run / inspect / why-recompute / verify-result /
-materialize-as-of / advance-sales-rollup."""
+materialize-as-of / advance-sales-rollup / reconcile-table."""
 
 from __future__ import annotations
 
@@ -14,6 +14,11 @@ from .materialize import (
     KeyConflictError,
     MaterializeError,
     materialize_as_of,
+)
+from .reconcile import (
+    PendingDecisions,
+    ReconcileError,
+    reconcile_table,
 )
 from .rollup import (
     RollupError,
@@ -97,6 +102,47 @@ def _advance_sales_rollup(args) -> int:
     return 0
 
 
+def _reconcile(args) -> int:
+    registry = SnapshotRegistry(args.registry)
+    try:
+        result = reconcile_table(
+            registry,
+            args.base,
+            args.left,
+            args.right,
+            args.table,
+            args.output_id,
+            decisions_path=args.decisions,
+            pending_out=sys.stdout.buffer,
+        )
+    except PendingDecisions:
+        # The JSONL conflict listing was already streamed to stdout.
+        return 3
+    except ReconcileError as exc:
+        print("cannot reconcile: %s" % exc, file=sys.stderr)
+        return 2
+    except SnapshotConflict as exc:
+        print("publication refused: %s" % exc, file=sys.stderr)
+        return 4
+    _print(
+        {
+            "output_id": result.snapshot.snapshot_id,
+            "digest": result.snapshot.digest,
+            "outcome": result.outcome,
+            "table": result.table,
+            "base": result.base_id,
+            "left": result.left_id,
+            "right": result.right_id,
+            "rows": result.rows,
+            "row_conflicts": result.row_conflicts,
+            "cell_conflicts": result.cell_conflicts,
+            "key_conflicts": result.key_conflicts,
+            "decisions_applied": result.decisions_applied,
+        }
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="bcache",
@@ -148,11 +194,25 @@ def main(argv: list[str] | None = None) -> int:
     p_rollup.add_argument("--state", required=True)
     p_rollup.add_argument("--expect", required=True, type=int)
 
+    p_rec = sub.add_parser(
+        "reconcile-table",
+        help="three-way merge of one lookup-keyed table across snapshots",
+    )
+    p_rec.add_argument("--registry", required=True)
+    p_rec.add_argument("--base", required=True)
+    p_rec.add_argument("--left", required=True)
+    p_rec.add_argument("--right", required=True)
+    p_rec.add_argument("--table", required=True)
+    p_rec.add_argument("--output-id", required=True)
+    p_rec.add_argument("--decisions")
+
     args = parser.parse_args(argv)
     if args.command == "materialize-as-of":
         return _materialize(args)
     if args.command == "advance-sales-rollup":
         return _advance_sales_rollup(args)
+    if args.command == "reconcile-table":
+        return _reconcile(args)
     store = CacheStore(args.cache)
     try:
         if args.command == "run":

@@ -75,6 +75,7 @@ bcache/            库代码
   store.py         缓存库、锁、所有权、确定性合同、run/inspect/why/verify
   materialize.py   时点快照（基准 + 无序更正日志 → 新快照）
   rollup.py        地区日销账表（按快照持续推进的增量汇总）
+  reconcile.py     三向对账（基准 + 左右两份修订 → 裁决后新快照）
   cli.py           命令行
 jobs/              两个手工合同作业
 tests/             单元测试、独立验收、并发测试、大快照生成器（无大数据入库）
@@ -94,6 +95,9 @@ python3 -I bcache_run.py materialize-as-of --registry <reg> --base <id> \
     --changes <log.jsonl> --effective-at <T> --known-through <S> --output-id <id>
 python3 -I bcache_run.py advance-sales-rollup --registry <reg> \
     --snapshot-id <id> --state <ledger.sqlite3> --expect <rev>
+python3 -I bcache_run.py reconcile-table --registry <reg> \
+    --base <id> --left <id> --right <id> --table <name> --output-id <id> \
+    [--decisions <file.jsonl>]
 ```
 
 ## 时点快照：`materialize-as-of`
@@ -210,6 +214,131 @@ registry）。比较输入之后只维护有贡献变化的日区组合：不重
 受影响门店经 `sales_state(store)` 索引定位关联销售，而不是每改一家门店就
 再扫一遍明细。中间数据落在临时磁盘暂存库，峰值内存与输入规模、变更规模
 无关。
+
+## 三向对账：`reconcile-table`
+
+两组维护人员拿同一份仓库资料独立修订、各自发布了快照。操作员显式指定共同
+基准 `--base` 与两份修订 `--left` / `--right`（不查找祖先、不维护分支
+历史），对**一张具有 text lookup 键的表**做三向对账，产物是现有 registry
+和 `reader` 可直接使用的完整快照；**其他表一律沿用基准**（包括空表），
+分支里的其他表不参与合并。三份快照中该表的有序列声明与键声明必须一致，
+每个现存行必须有非 NULL 的键，同一输入内键不得重复，否则整次拒绝。
+
+### 行/列阶段
+
+行按 `(table, row_id)` 对齐，不用可改的键值对齐。两边都保留的基准行按列
+合并：相同改动留一份，只有一边改过就采纳该边，两边改成不同值才是**列
+冲突**，交审核员选左或右。比较保留类型；缺单元格 ≠ 显式 null。两边都删
+除、或一边删除而另一边没改，结果为删除；**删除对修改**是整行冲突，选侧
+即选该侧整行或删除。基准中不存在的行：只在一侧新增就整行采纳；两侧新增
+同一行号且内容相同留一份，内容不同是整行冲突，不拼接两份新行。整行冲突
+不再拆出列冲突。
+
+### 键阶段
+
+行/列冲突全部裁决后，才对合出的键归属做集合式检查：同一编码落在多行时，
+按参与行逐条列出。审核员给每个参与争夺的行号指定最终文本键（可保留原键
+或指定新键），不得借此改动其他行或其他列。所有键裁决一起生效，以整张
+结果表的最终状态检验唯一性——可以把一行的键交给另一行，只要最终不重；
+与未参与冲突的行或另一组裁决撞键则此次不发布。行/列阶段未决时不猜测
+中间键归属。
+
+### 查看与提交（同一命令）
+
+不带 `--decisions` 是查看；带上即提交裁决。待裁决时退出码为 3，标准输出
+为 UTF-8 JSONL：首行给出冲突阶段、表名和按基准/左/右排列的内容摘要
+（键阶段另带一个 `token`，绑定三份输入与已采纳的全部行/列裁决），后续
+每行一条未解决冲突，顺序稳定。行阶段记录按行号、可选列名标识，给出基准
+和两侧的值或行，用 `state` 区分 `absent`（行不存在）/ `missing`（列缺
+失）/ `null` / `value`。裁决文件也是 JSONL：首行带相同的表和三份输入
+摘要，后续每行一条裁决（行/列裁决选 `side`，键裁决按行号指定 `key`）。
+提交键裁决时须带回 `token` 并同时提交那些行/列裁决；改变前一阶段的选择
+会使旧标识失效，重排同一批裁决不改变含义。重复裁决、引用不存在的冲突、
+错误类型、上下文不匹配、或在前一阶段未解决时提交键裁决都是错误
+（退出码 2）。成功退出码 0，输出 ID 与内容摘要；目标 ID 已有不同内容
+退出码 4。只有完全校验成功才发布，失败不留可打开的半成品，输入与
+`current` 一律不动；中间状态全部落在临时 SQLite，峰值内存不随行数或
+冲突数增长。
+
+### 可复跑示例（从查看到提交）
+
+```bash
+cd behavioral_cache
+DEMO=/tmp/recon-demo
+rm -rf "$DEMO" && mkdir -p "$DEMO"
+
+# 三份快照：base 共同基准；left 甲组（改 1 的编码、2 的备注）；
+# right 乙组（补 1 的备注、改 2 的备注、改 3 的编码）
+python3 -I - <<'PY'
+import os, sys
+sys.path.insert(0, os.getcwd())
+from bcache import SnapshotBuilder, SnapshotRegistry
+
+reg = SnapshotRegistry("/tmp/recon-demo/registry")
+schema = [("code", "text"), ("remark", "text")]
+def build(name, rows):
+    b = SnapshotBuilder("/tmp/recon-demo/build-" + name)
+    b.add_table("stores", schema, key_col="code")
+    for rid, vals in rows.items():
+        b.add_row("stores", rid, vals)
+    reg.publish(b.finalize(snapshot_id=name))
+
+build("base",  {1: {"code": "A", "remark": "r1"},
+                2: {"code": "B", "remark": "r2"},
+                3: {"code": "C", "remark": "r3"}})
+build("left",  {1: {"code": "X", "remark": "r1"},
+                2: {"code": "B", "remark": "L"},
+                3: {"code": "C", "remark": "r3"}})
+build("right", {1: {"code": "A", "remark": "r1b"},
+                2: {"code": "B", "remark": "R"},
+                3: {"code": "X", "remark": "r3"}})
+PY
+
+# 第一轮：行/列阶段。行 1 两边改的是不同列（编码 vs 备注），自动并存；
+# 行 2 的备注两边改法不同，成为列冲突。退出码 3。
+python3 -I bcache_run.py reconcile-table --registry "$DEMO/registry" \
+    --base base --left left --right right --table stores \
+    --output-id merged > "$DEMO/round1.jsonl"
+echo "exit=$?"   # 3
+cat "$DEMO/round1.jsonl"
+# {"kind":"header","stage":"rows","table":"stores","inputs":{...}}
+# {"kind":"conflict","conflict":"cell","row_id":2,"column":"remark",
+#  "base":{"state":"value","value":"r2"},"left":{"state":"value","value":"L"},
+#  "right":{"state":"value","value":"R"}}
+
+# 裁决行 2 的备注选左边：把首行原样放进裁决文件，再追加裁决行
+head -1 "$DEMO/round1.jsonl" > "$DEMO/decisions.jsonl"
+cat >> "$DEMO/decisions.jsonl" <<'EOF'
+{"kind":"decision","conflict":"cell","row_id":2,"column":"remark","side":"left"}
+EOF
+
+# 第二轮：键阶段。行 1 与行 3 的编码都合成了 X，成为键冲突；首行带 token。
+python3 -I bcache_run.py reconcile-table --registry "$DEMO/registry" \
+    --base base --left left --right right --table stores \
+    --output-id merged --decisions "$DEMO/decisions.jsonl" \
+    > "$DEMO/round2.jsonl"
+echo "exit=$?"   # 3
+cat "$DEMO/round2.jsonl"
+# {"kind":"header","stage":"keys",...,"token":"..."}
+# {"kind":"conflict","conflict":"key","key":"X","row_id":1}
+# {"kind":"conflict","conflict":"key","key":"X","row_id":3}
+
+# 键裁决：1 保留 X，3 改回 C。须带回 token 并同时提交上一步的行/列裁决。
+head -1 "$DEMO/round2.jsonl" > "$DEMO/decisions.jsonl"
+cat >> "$DEMO/decisions.jsonl" <<'EOF'
+{"kind":"decision","conflict":"cell","row_id":2,"column":"remark","side":"left"}
+{"kind":"decision","conflict":"key","row_id":1,"key":"X"}
+{"kind":"decision","conflict":"key","row_id":3,"key":"C"}
+EOF
+
+python3 -I bcache_run.py reconcile-table --registry "$DEMO/registry" \
+    --base base --left left --right right --table stores \
+    --output-id merged --decisions "$DEMO/decisions.jsonl"
+# exit=0，打印 output_id / digest / outcome="published"
+# 合并结果：1:{code:X, remark:r1b}  2:{code:B, remark:L}  3:{code:C, remark:r3}
+```
+
+合并版是普通快照，现有作业用 `--snapshot-id merged` 直接读取。
 
 ## 作业合同
 
