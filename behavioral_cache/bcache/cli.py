@@ -1,4 +1,5 @@
-"""Command line entries: run / inspect / why-recompute / verify-result."""
+"""Command line entries: run / inspect / why-recompute / verify-result /
+materialize-as-of / advance-sales-rollup."""
 
 from __future__ import annotations
 
@@ -13,6 +14,11 @@ from .materialize import (
     KeyConflictError,
     MaterializeError,
     materialize_as_of,
+)
+from .rollup import (
+    RollupError,
+    RollupRevisionError,
+    advance_sales_rollup,
 )
 from .snapshot import SnapshotConflict, SnapshotRegistry
 from .store import CacheStore
@@ -67,6 +73,30 @@ def _materialize(args) -> int:
     return 0
 
 
+def _advance_sales_rollup(args) -> int:
+    registry = SnapshotRegistry(args.registry)
+    try:
+        result = advance_sales_rollup(
+            registry, args.snapshot_id, args.state, args.expect
+        )
+    except RollupRevisionError as exc:
+        print("stale revision: %s" % exc, file=sys.stderr)
+        return 3
+    except RollupError as exc:
+        print("cannot advance rollup: %s" % exc, file=sys.stderr)
+        return 2
+    _print(
+        {
+            "revision": result.revision,
+            "snapshot_id": result.snapshot_id,
+            "snapshot_digest": result.snapshot_digest,
+            "advanced": result.advanced,
+            "stats": result.stats,
+        }
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="bcache",
@@ -109,9 +139,20 @@ def main(argv: list[str] | None = None) -> int:
     p_mat.add_argument("--known-through", required=True, type=int)
     p_mat.add_argument("--output-id", required=True)
 
+    p_rollup = sub.add_parser(
+        "advance-sales-rollup",
+        help="advance the day/region sales rollup ledger to a published snapshot",
+    )
+    p_rollup.add_argument("--registry", required=True)
+    p_rollup.add_argument("--snapshot-id", required=True)
+    p_rollup.add_argument("--state", required=True)
+    p_rollup.add_argument("--expect", required=True, type=int)
+
     args = parser.parse_args(argv)
     if args.command == "materialize-as-of":
         return _materialize(args)
+    if args.command == "advance-sales-rollup":
+        return _advance_sales_rollup(args)
     store = CacheStore(args.cache)
     try:
         if args.command == "run":

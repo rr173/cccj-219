@@ -26,6 +26,14 @@ from .predicate import (
 )
 from .reader import LookupResult, Reader, RecordingReader, Row
 from .replayer import ReplayReport, ReplayValidator, observations_equal
+from .rollup import (
+    RollupContractError,
+    RollupError,
+    RollupOverflowError,
+    RollupResult,
+    RollupRevisionError,
+    advance_sales_rollup,
+)
 from .snapshot import Snapshot, SnapshotBuilder, SnapshotRegistry
 from .store import CacheStore, DeterminismViolation, RunResult, WhyReport
 
@@ -63,6 +71,12 @@ __all__ = [
     "ReplayReport",
     "ReplayValidator",
     "observations_equal",
+    "RollupContractError",
+    "RollupError",
+    "RollupOverflowError",
+    "RollupResult",
+    "RollupRevisionError",
+    "advance_sales_rollup",
     "Snapshot",
     "SnapshotBuilder",
     "SnapshotRegistry",

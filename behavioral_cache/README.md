@@ -74,6 +74,7 @@ bcache/            库代码
   jobs.py          作业加载、版本固定、合作式合同执行
   store.py         缓存库、锁、所有权、确定性合同、run/inspect/why/verify
   materialize.py   时点快照（基准 + 无序更正日志 → 新快照）
+  rollup.py        地区日销账表（按快照持续推进的增量汇总）
   cli.py           命令行
 jobs/              两个手工合同作业
 tests/             单元测试、独立验收、并发测试、大快照生成器（无大数据入库）
@@ -91,6 +92,8 @@ python3 -I bcache_run.py inspect <entry_id> --cache <cache>
 python3 -I bcache_run.py verify-result <entry_id> --cache <cache>
 python3 -I bcache_run.py materialize-as-of --registry <reg> --base <id> \
     --changes <log.jsonl> --effective-at <T> --known-through <S> --output-id <id>
+python3 -I bcache_run.py advance-sales-rollup --registry <reg> \
+    --snapshot-id <id> --state <ledger.sqlite3> --expect <rev>
 ```
 
 ## 时点快照：`materialize-as-of`
@@ -149,6 +152,64 @@ python3 -I bcache_run.py materialize-as-of \
 - 日志逐行解析并落入临时 SQLite 暂存；只保留 T 的获胜者，基准逐表逐行流式
   复制，最终摘要也以流式游标计算——峰值内存不随日志条数、基准行数或获胜行
   数线性增长。逻辑内容相同的快照内容摘要与日志顺序、重送及输出 ID 无关。
+
+## 地区日销账表：`advance-sales-rollup`
+
+门店归区经常在结账后调整。运营方每次给出一份**已经发布**的快照 ID，账表
+（一个独立的 SQLite 状态库，与作业缓存无关）随之推进一版；下游用 SQL 直接
+读同一份账表，无需逐天重跑作业。本命令**不**生成新快照，也**不**走作业缓存，
+只读 `--snapshot-id` 指定的不可变快照（从不解析 `current`）。
+
+```bash
+python3 -I bcache_run.py advance-sales-rollup \
+    --registry /srv/bcache/registry \
+    --snapshot-id 2026-11-21 \
+    --state /srv/ledger/rollup.sqlite3 \
+    --expect 1
+```
+
+成功时打印 `revision`、`snapshot_id`、`snapshot_digest`（附 `advanced` 与
+本次推进的统计）。退出码：`0` 成功（含"该推进已提交过"的重试）；`2` 缺表、
+列类型错误、行不合合同、最终金额越 int64 或参数非法；`3` 版本过旧。
+
+### 输入合同
+
+- `sales`：按 `row_id` 标识一笔销售，四列 `day:int64`、`store:text`、
+  `buyer:text`、`amount:int64`。
+- `stores`：`store:text`（必须声明为 lookup 键）、`region:text`。
+- 这些列在参与的每行都必须有非空值；缺表、错误列类型或不合合同的行拒绝
+  整次推进（状态不变）；表存在但为空是合法的。其他表和列不影响账表；
+  字符串按原值匹配，不做大小写转换或去空格。
+
+### 账表语义
+
+公开表 `rollup(day, region, gross, distinct_buyers)`：每个仍有销售的
+（日， 地区）组合恰有一行。门店不在 `stores` 时地区记为 SQL `NULL`，与任意
+实际地区不同。`gross` 是有符号金额之和（允许负数和零；净额为零不等于没有
+销售，不删行；最后一笔销售迁走或被删除后才移除该组合）。`distinct_buyers`
+是组合内不同买家数，同一买家在多家门店消费只算一位。按目标快照算出的最终
+金额必须能存为 int64，否则整次拒绝；中间金额越界但最终合法不会误拒绝
+（增量以 Python 整数求和，不经 SQL 的 64 位 SUM）。
+
+`rollup_meta` 唯一一行 `revision, snapshot_id, snapshot_digest`：摘要取自
+registry 的快照内容摘要，`revision` 从 1 开始。空状态用 `--expect 0` 初始化；
+以后必须传当前版本，成功提交进一版（即使结果不变）。唯一重试例外：当前版本
+已是 `expect+1` 且 ID、摘要与本请求相同，说明推进已提交，直接返回当前版本，
+不再写入；其他过期请求报错。内部状态、账表与版本在同一事务提交，失败或中断
+不会只前进一半；两位操作员用同一旧版本推进到不同目标，只有一个成功，另一个
+拿到退出码 3 后可从新的当前版本继续。在一个 SQLite 读事务里读取
+`rollup` 与 `rollup_meta`，只能看到同一代。
+
+### 增量维护
+
+首轮从空状态整表构建。以后每次流式扫描目标快照的两张输入表来发现变化
+（快照不提供改动清单；已接收的数据留在状态库，下一次不依赖上轮快照仍在
+registry）。比较输入之后只维护有贡献变化的日区组合：不重新聚合全部销售、
+不扫描未受影响的日区、不重建整张 `rollup`。没有改动的销售会因门店移区、
+消失、补登而改变贡献；仅改未使用的列或门店资料的物理行号不触碰账表。
+受影响门店经 `sales_state(store)` 索引定位关联销售，而不是每改一家门店就
+再扫一遍明细。中间数据落在临时磁盘暂存库，峰值内存与输入规模、变更规模
+无关。
 
 ## 作业合同
 
